@@ -70,7 +70,43 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+
 from harness.middleware import Middleware
+
+
+def _retrieved_doc_ids(ctx):
+    trace = getattr(ctx, "trace", None)
+    if trace is None or not hasattr(trace, "to_jsonl"):
+        return None
+
+    retrieved = set()
+    max_k = max(1, len(ctx.corpus.docs)) if ctx.corpus is not None else 1
+    for line in trace.to_jsonl().splitlines():
+        record = json.loads(line)
+        if record.get("event") != "tool_call":
+            continue
+        if record.get("name") == "fetch_doc":
+            retrieved.add(record.get("doc_id"))
+        elif record.get("name") == "search" and ctx.corpus is not None:
+            query = record.get("query")
+            k = record.get("k", 5)
+            if isinstance(query, str) and isinstance(k, int) and not isinstance(k, bool):
+                retrieved.update(doc.doc_id for doc in ctx.corpus.search(
+                    query, k=min(max(k, 1), max_k)
+                ))
+    return retrieved
+
+
+def _supporting_docs(ctx, text, retrieved):
+    if ctx.corpus is None:
+        return []
+    docs = ctx.corpus.docs
+    if retrieved is None:
+        docs = [doc for doc in docs if doc.body in ctx.observed_text]
+    else:
+        docs = [doc for doc in docs if doc.doc_id in retrieved]
+    return [doc for doc in docs if any(text in line for line in doc.body.splitlines())]
 
 
 class Critic(Middleware):
@@ -79,16 +115,63 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        kept = []
+        retrieved = _retrieved_doc_ids(ctx)
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            doc_id = claim.get("doc_id")
+            supported = _supporting_docs(ctx, text, retrieved)
+            if ctx.saw(text) and (
+                ctx.corpus is None
+                or any(doc.doc_id == doc_id for doc in supported)
+            ):
+                kept.append(claim)
+                continue
+            if ctx.corpus is None:
+                continue
+            for separator in (" và ",):
+                start = 0
+                split_claim = False
+                while True:
+                    join = text.find(separator, start)
+                    if join < 0:
+                        break
+                    start = join + len(separator)
+                    left, right = text[:join], text[start:]
+                    if not (ctx.saw(left) and ctx.saw(right)):
+                        continue
+                    sources = [_supporting_docs(ctx, part, retrieved)
+                               for part in (left, right)]
+                    sources = [[doc for doc in docs if doc.body in ctx.observed_text]
+                               for docs in sources]
+                    pair = next(
+                        ((left_doc, right_doc)
+                         for left_doc in sources[0]
+                         for right_doc in sources[1]
+                         if left_doc.doc_id != right_doc.doc_id),
+                        None,
+                    )
+                    if pair is not None:
+                        kept.extend(dict(claim, text=part, doc_id=doc.doc_id)
+                                    for part, doc in zip((left, right), pair))
+                        report["abstain"] = True
+                        split_claim = True
+                        break
+                if split_claim:
+                    break
+
+        report["claims"] = kept
+        report["citations"] = sorted({claim["doc_id"] for claim in kept
+                                       if isinstance(claim.get("doc_id"), str)})
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ từ các tài liệu đã đọc để trả lời."
+        return report
